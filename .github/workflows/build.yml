@@ -30,7 +30,23 @@ jobs:
       - name: Restore NuGet packages
         run: dotnet restore PsiphonUI\PsiphonUI.csproj
 
-      # ── ۴. Build (framework-dependent, dll های جداگانه) ───────
+      # ── ۴. تزریق مقادیر واقعی Psiphon از GitHub Secrets ─────────
+      #   بدون این، tunnel-core با placeholder ها exit code 1 می‌ده
+      #   مقادیر رو در: Settings → Secrets and variables → Actions بذار
+      - name: Inject EmbeddedValues
+        shell: pwsh
+        env:
+          PROPAGATION_CHANNEL_ID: ${{ secrets.PROPAGATION_CHANNEL_ID }}
+          SPONSOR_ID: ${{ secrets.SPONSOR_ID }}
+        run: |
+          $file = "PsiphonUI\Services\EmbeddedValues.cs"
+          (Get-Content $file) `
+            -replace '"PROPAGATION_CHANNEL_ID"', "`"$env:PROPAGATION_CHANNEL_ID`"" `
+            -replace '"SPONSOR_ID"',             "`"$env:SPONSOR_ID`"" |
+          Set-Content $file
+          Write-Host "EmbeddedValues injected OK"
+
+      # ── ۵. Build (framework-dependent, dll های جداگانه) ───────
       #   این همون خروجی release اصلی هست:
       #   bin\Release\net8.0-windows10.0.19041.0\win-x64\
       #     PsiphonUI.exe  + کنارش تمام dll ها
