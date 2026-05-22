@@ -106,7 +106,21 @@ jobs:
           Write-Host "  PropagationChannelId = $($json.PropagationChannelId)"
           Write-Host "  SponsorId            = $($json.SponsorId)"
           Write-Host "  RSL sig key len      = $($json.RemoteServerListSignaturePublicKey.Length)"
-
+          
+      - name: Fetch Psiphon server list
+        shell: pwsh
+        run: |
+          $serverList = "$env:APPDATA\Psiphon3\server_list.dat"
+          
+          # صبر کن تا server_list.dat هم نوشته بشه (psiphon3 باید در حال اجرا بوده باشه)
+          if (Test-Path $serverList) {
+              Copy-Item $serverList "PsiphonUI\Resources\server_entries.txt"
+              $lines = (Get-Content $serverList).Count
+              Write-Host "server_list.dat copied: $lines entries"
+          } else {
+              Write-Warning "server_list.dat not found - tunnel-core will use remote server list URLs only"
+          }
+          
       # ── ۴. تزریق به EmbeddedValues.cs ────────────────────────────────────
       - name: Inject EmbeddedValues
         shell: pwsh
