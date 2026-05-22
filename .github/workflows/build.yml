@@ -25,213 +25,150 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      # ── ۳. Python (برای parse کردن exe رسمی) ──────────────────────────────
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      # ── ۴. دانلود psiphon3.exe رسمی و استخراج مقادیر ──────────────────────
+      # ── ۳. دانلود psiphon3.exe و اجرای کوتاه برای generate کردن psiphon.config
       #
-      # روش کار:
-      #   psiphon3.exe یک PE32 executable هست که tunnel-core-config.json
-      #   رو به صورت یک null-terminated ASCII string داخل خودش embed کرده.
-      #   این JSON شامل PropagationChannelId، SponsorId و بقیه کلیدها هست.
-      #   کافیه باینری رو به صورت رشته‌های ASCII بخونیم و JSON رو پیدا کنیم.
-      #
-      - name: Extract EmbeddedValues from official Psiphon client
-        shell: python
+      # psiphon3.exe هنگام اجرا فایل psiphon.config رو در
+      # %AppData%\Psiphon3\psiphon.config می‌نویسه.
+      # این config فایل JSON هست که شامل PropagationChannelId، SponsorId
+      # و تمام کلیدهای public key هست — دقیقاً همان چیزی که نیاز داریم.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Extract config from official Psiphon client
+        shell: pwsh
         run: |
-          import urllib.request
-          import re
-          import json
-          import os
-          import sys
+          # دانلود
+          Write-Host "Downloading psiphon3.exe ..."
+          Invoke-WebRequest -Uri "https://psiphon.ca/psiphon3.exe" `
+                            -OutFile "psiphon3.exe" `
+                            -UseBasicParsing
+          $mb = [math]::Round((Get-Item "psiphon3.exe").Length / 1MB, 1)
+          Write-Host "Downloaded: $mb MB"
 
-          print("Downloading official psiphon3.exe ...")
-          url = "https://psiphon.ca/psiphon3.exe"
-          exe_path = "psiphon3.exe"
-          urllib.request.urlretrieve(url, exe_path)
-          size_mb = os.path.getsize(exe_path) / (1024*1024)
-          print(f"Downloaded: {size_mb:.1f} MB")
+          # اجرای psiphon3.exe برای چند ثانیه تا config رو بنویسه
+          Write-Host "Launching psiphon3.exe to generate config..."
+          $proc = Start-Process -FilePath ".\psiphon3.exe" `
+                                -PassThru `
+                                -WindowStyle Hidden
+          
+          # صبر می‌کنیم تا config.json نوشته بشه (max 30 ثانیه)
+          $configPath = "$env:APPDATA\Psiphon3\psiphon.config"
+          $waited = 0
+          while (-not (Test-Path $configPath) -and $waited -lt 30) {
+              Start-Sleep -Seconds 1
+              $waited++
+              Write-Host "  Waiting for config... ($waited s)"
+          }
 
-          # خوندن باینری و استخراج رشته‌های ASCII قابل print
-          with open(exe_path, "rb") as f:
-              raw = f.read()
+          # متوقف کردن psiphon3
+          try { $proc | Stop-Process -Force } catch {}
+          # متوقف کردن هر psiphon-tunnel-core احتمالی
+          Get-Process -Name "psiphon-tunnel-core" -ErrorAction SilentlyContinue | Stop-Process -Force
 
-          # پیدا کردن تمام رشته‌های printable با طول حداقل 8 کاراکتر
-          strings = re.findall(rb'[ -~]{8,}', raw)
-          text_blob = b"\n".join(strings).decode("ascii", errors="ignore")
+          if (-not (Test-Path $configPath)) {
+              Write-Error "psiphon.config was not created after 30 seconds!"
+              exit 1
+          }
 
-          # ── پیدا کردن PropagationChannelId (رشته HEX 16 کاراکتری) ──
-          # در embeddedvalues.h این مقادیر دقیقاً 16 کاراکتر uppercase hex هستن
-          # ولی برای اطمینان هم uppercase هم lowercase رو چک می‌کنیم
-          hex16 = re.findall(r'\b([0-9A-Fa-f]{16})\b', text_blob)
-          hex16_unique = list(dict.fromkeys(hex16))  # حفظ ترتیب، حذف تکراری
-          print(f"\nHEX-16 candidates found: {hex16_unique[:10]}")
+          Write-Host "Config found at: $configPath"
+          $configSize = (Get-Item $configPath).Length
+          Write-Host "Config size: $configSize bytes"
 
-          # ── پیدا کردن JSON config که tunnel-core داخل exe embed شده ──
-          # tunnel-core config به صورت JSON با کلیدهای مشخص embed میشه
-          json_pattern = re.findall(
-              r'\{[^{}]*"PropagationChannelId"\s*:\s*"([^"]+)"[^{}]*"SponsorId"\s*:\s*"([^"]+)"[^{}]*\}',
-              text_blob
+          # خواندن JSON
+          $json = Get-Content $configPath -Raw | ConvertFrom-Json
+
+          # استخراج فیلدهای مورد نیاز
+          $propChannelId = $json.PropagationChannelId
+          $sponsorId     = $json.SponsorId
+
+          Write-Host "`n=== Extracted Values ==="
+          Write-Host "  PropagationChannelId = $propChannelId"
+          Write-Host "  SponsorId            = $sponsorId"
+
+          if (-not $propChannelId -or -not $sponsorId) {
+              Write-Host "`nConfig JSON keys available:"
+              $json.PSObject.Properties.Name | ForEach-Object { Write-Host "  $_" }
+              Write-Error "Failed to extract PropagationChannelId or SponsorId"
+              exit 1
+          }
+
+          # ذخیره در GITHUB_ENV برای step های بعدی
+          function Set-Env($name, $value) {
+              if ($value) {
+                  # اگه مقدار multi-line بود (مثل کلیدهای public key) از EOF delimiter استفاده کن
+                  $delim = "EOF_" + [System.Guid]::NewGuid().ToString("N").Substring(0,8)
+                  Add-Content -Path $env:GITHUB_ENV -Value "$name<<$delim"
+                  Add-Content -Path $env:GITHUB_ENV -Value $value
+                  Add-Content -Path $env:GITHUB_ENV -Value $delim
+              }
+          }
+
+          Set-Env "PSI_PROPAGATION_CHANNEL_ID" $propChannelId
+          Set-Env "PSI_SPONSOR_ID"             $sponsorId
+
+          # کلیدهای public key — اگه وجود داشتن
+          $keys = @(
+              @{ env="PSI_REMOTE_SERVER_LIST_SIG_KEY";  prop="RemoteServerListSignaturePublicKey" },
+              @{ env="PSI_SERVER_ENTRY_SIG_KEY";        prop="ServerEntrySignaturePublicKey" },
+              @{ env="PSI_FEEDBACK_ENC_KEY";            prop="FeedbackEncryptionPublicKey" },
+              @{ env="PSI_UPGRADE_SIG_KEY";             prop="UpgradeSignaturePublicKey" },
+              @{ env="PSI_REMOTE_SERVER_LIST_URLS";     prop="RemoteServerListURLs" },
+              @{ env="PSI_OSL_ROOT_URLS";               prop="ObfuscatedServerListRootURLs" },
+              @{ env="PSI_UPGRADE_URLS";                prop="UpgradeDownloadURLs" }
           )
+          foreach ($k in $keys) {
+              $val = $json.($k.prop)
+              if ($val) {
+                  if ($val -is [Array] -or $val -is [System.Management.Automation.PSCustomObject]) {
+                      $val = $val | ConvertTo-Json -Compress -Depth 10
+                  }
+                  Set-Env $k.env $val
+                  Write-Host "  $($k.env) extracted (len=$($val.Length))"
+              }
+          }
 
-          # اگه JSON مستقیم پیدا نشد، بصورت جداگانه دنبال فیلدها بگرد
-          prop_channel_id = ""
-          sponsor_id = ""
+          Write-Host "`nExtraction complete!"
 
-          if json_pattern:
-              prop_channel_id = json_pattern[0][0]
-              sponsor_id = json_pattern[0][1]
-              print(f"\nFound via JSON pattern:")
-              print(f"  PropagationChannelId = {prop_channel_id}")
-              print(f"  SponsorId            = {sponsor_id}")
-          else:
-              # روش دوم: پیدا کردن مستقیم با regex در کل blob
-              m = re.search(r'PropagationChannelId["\s:]+([0-9A-Fa-f]{16})', text_blob)
-              if m:
-                  prop_channel_id = m.group(1)
-              m2 = re.search(r'SponsorId["\s:]+([0-9A-Fa-f]{16})', text_blob)
-              if m2:
-                  sponsor_id = m2.group(1)
-              print(f"\nFound via regex search:")
-              print(f"  PropagationChannelId = {prop_channel_id}")
-              print(f"  SponsorId            = {sponsor_id}")
-
-          # ── استخراج کلیدهای public key (base64، معمولاً 44+ کاراکتر) ──
-          # RemoteServerListSignaturePublicKey و ServerEntrySignaturePublicKey
-          # ed25519 public keys هستن که به صورت base64 ذخیره میشن
-          b64_keys = re.findall(
-              r'[A-Za-z0-9+/]{43,}={0,2}',
-              text_blob
-          )
-          b64_unique = list(dict.fromkeys(b64_keys))
-          print(f"\nBase64 key candidates (first 5): {b64_unique[:5]}")
-
-          # ── جستجوی مستقیم‌تر برای کلیدها با context ──
-          remote_server_list_sig_key = ""
-          server_entry_sig_key = ""
-          feedback_enc_key = ""
-          upgrade_sig_key = ""
-
-          # پیدا کردن RemoteServerListSignaturePublicKey
-          m = re.search(r'REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY[^"]*"([A-Za-z0-9+/=]{44,})"', text_blob)
-          if m:
-              remote_server_list_sig_key = m.group(1)
-          m = re.search(r'SERVER_ENTRY_SIGNATURE_PUBLIC_KEY[^"]*"([A-Za-z0-9+/=]{44,})"', text_blob)
-          if m:
-              server_entry_sig_key = m.group(1)
-          m = re.search(r'FEEDBACK_ENCRYPTION_PUBLIC_KEY[^"]*"([A-Za-z0-9+/=]{44,})"', text_blob)
-          if m:
-              feedback_enc_key = m.group(1)
-          m = re.search(r'UPGRADE_SIGNATURE_PUBLIC_KEY[^"]*"([A-Za-z0-9+/=]{44,})"', text_blob)
-          if m:
-              upgrade_sig_key = m.group(1)
-
-          # ── ذخیره نتایج به عنوان environment variable برای step های بعدی ──
-          env_file = os.environ.get("GITHUB_ENV", "")
-          if not env_file:
-              print("WARNING: GITHUB_ENV not set, running locally?")
-              env_file = "local_env.txt"
-
-          # اگه مقادیر پیدا نشدن، از hex16 candidates استفاده کن
-          if not prop_channel_id and len(hex16_unique) >= 1:
-              prop_channel_id = hex16_unique[0]
-              print(f"Fallback PropagationChannelId from hex16[0]: {prop_channel_id}")
-          if not sponsor_id and len(hex16_unique) >= 2:
-              sponsor_id = hex16_unique[1]
-              print(f"Fallback SponsorId from hex16[1]: {sponsor_id}")
-
-          with open(env_file, "a") as f:
-              f.write(f"PSI_PROPAGATION_CHANNEL_ID={prop_channel_id}\n")
-              f.write(f"PSI_SPONSOR_ID={sponsor_id}\n")
-              f.write(f"PSI_REMOTE_SERVER_LIST_SIG_KEY={remote_server_list_sig_key}\n")
-              f.write(f"PSI_SERVER_ENTRY_SIG_KEY={server_entry_sig_key}\n")
-              f.write(f"PSI_FEEDBACK_ENC_KEY={feedback_enc_key}\n")
-              f.write(f"PSI_UPGRADE_SIG_KEY={upgrade_sig_key}\n")
-
-          print("\n=== Values written to GITHUB_ENV ===")
-          print(f"  PSI_PROPAGATION_CHANNEL_ID = {prop_channel_id}")
-          print(f"  PSI_SPONSOR_ID             = {sponsor_id}")
-          print(f"  PSI_REMOTE_SERVER_LIST_SIG_KEY (len={len(remote_server_list_sig_key)})")
-          print(f"  PSI_SERVER_ENTRY_SIG_KEY   (len={len(server_entry_sig_key)})")
-
-          # اگه PropagationChannelId یا SponsorId خالی بود، fail کن
-          if not prop_channel_id or not sponsor_id:
-              print("\nERROR: Could not extract PropagationChannelId or SponsorId!")
-              print("Dumping all HEX-16 candidates for diagnosis:")
-              for i, h in enumerate(hex16_unique[:20]):
-                  print(f"  [{i}] {h}")
-              sys.exit(1)
-
-          print("\nExtraction successful!")
-
-      # ── ۵. تزریق مقادیر استخراج‌شده به EmbeddedValues.cs ─────────────────
+      # ── ۴. تزریق مقادیر به EmbeddedValues.cs ────────────────────────────
       - name: Inject values into EmbeddedValues.cs
         shell: pwsh
         run: |
           $file = "PsiphonUI\Services\EmbeddedValues.cs"
-
-          if (-not (Test-Path $file)) {
-              Write-Error "EmbeddedValues.cs not found at: $file"
-              exit 1
-          }
+          if (-not (Test-Path $file)) { Write-Error "EmbeddedValues.cs not found!"; exit 1 }
 
           $content = Get-Content $file -Raw
 
-          # تابع کمکی برای replace کردن ایمن
-          function Replace-Value {
-              param($text, $placeholder, $value, $label)
-              if ($value -and $value -ne "") {
+          function Replace-If-Set($text, $placeholder, $value, $label) {
+              if ($value) {
                   $escaped = [regex]::Escape($placeholder)
-                  $result = $text -replace $escaped, $value
-                  if ($result -ne $text) {
-                      Write-Host "  OK: $label = $value"
-                  } else {
-                      Write-Warning "  SKIP: placeholder '$placeholder' not found for $label"
-                  }
-                  return $result
-              } else {
-                  Write-Warning "  EMPTY: $label value is empty, skipping"
-                  return $text
+                  $new = $text -replace $escaped, ($value -replace '\\', '\\')
+                  if ($new -ne $text) { Write-Host "  OK: $label" }
+                  else { Write-Warning "  SKIP: '$placeholder' not found for $label" }
+                  return $new
               }
+              Write-Warning "  EMPTY: $label"
+              return $text
           }
 
-          Write-Host "`n=== Injecting EmbeddedValues ==="
-          $content = Replace-Value $content "PROPAGATION_CHANNEL_ID" $env:PSI_PROPAGATION_CHANNEL_ID "PropagationChannelId"
-          $content = Replace-Value $content "SPONSOR_ID"             $env:PSI_SPONSOR_ID             "SponsorId"
-
-          if ($env:PSI_REMOTE_SERVER_LIST_SIG_KEY -ne "") {
-              $content = Replace-Value $content "REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY" $env:PSI_REMOTE_SERVER_LIST_SIG_KEY "RemoteServerListSignaturePublicKey"
-          }
-          if ($env:PSI_SERVER_ENTRY_SIG_KEY -ne "") {
-              $content = Replace-Value $content "SERVER_ENTRY_SIGNATURE_PUBLIC_KEY" $env:PSI_SERVER_ENTRY_SIG_KEY "ServerEntrySignaturePublicKey"
-          }
-          if ($env:PSI_FEEDBACK_ENC_KEY -ne "") {
-              $content = Replace-Value $content "FEEDBACK_ENCRYPTION_PUBLIC_KEY" $env:PSI_FEEDBACK_ENC_KEY "FeedbackEncryptionPublicKey"
-          }
-          if ($env:PSI_UPGRADE_SIG_KEY -ne "") {
-              $content = Replace-Value $content "UPGRADE_SIGNATURE_PUBLIC_KEY" $env:PSI_UPGRADE_SIG_KEY "UpgradeSignaturePublicKey"
-          }
+          Write-Host "=== Injecting EmbeddedValues ==="
+          $content = Replace-If-Set $content "PROPAGATION_CHANNEL_ID" $env:PSI_PROPAGATION_CHANNEL_ID "PropagationChannelId"
+          $content = Replace-If-Set $content "SPONSOR_ID"             $env:PSI_SPONSOR_ID             "SponsorId"
+          $content = Replace-If-Set $content "REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY" $env:PSI_REMOTE_SERVER_LIST_SIG_KEY  "RemoteServerListSignaturePublicKey"
+          $content = Replace-If-Set $content "SERVER_ENTRY_SIGNATURE_PUBLIC_KEY"       $env:PSI_SERVER_ENTRY_SIG_KEY        "ServerEntrySignaturePublicKey"
+          $content = Replace-If-Set $content "FEEDBACK_ENCRYPTION_PUBLIC_KEY"          $env:PSI_FEEDBACK_ENC_KEY            "FeedbackEncryptionPublicKey"
+          $content = Replace-If-Set $content "UPGRADE_SIGNATURE_PUBLIC_KEY"            $env:PSI_UPGRADE_SIG_KEY             "UpgradeSignaturePublicKey"
 
           Set-Content $file $content -NoNewline
-          Write-Host "`nEmbeddedValues.cs updated successfully."
+          Write-Host "EmbeddedValues.cs updated."
 
-          # نمایش خطوط کلیدی برای تأیید (بدون نشون دادن مقادیر حساس در log)
-          Write-Host "`n=== Verifying placeholders replaced ==="
+          # بررسی اینکه placeholder های اصلی جایگزین شدن
           $remaining = Select-String -Path $file -Pattern '"PROPAGATION_CHANNEL_ID"|"SPONSOR_ID"'
-          if ($remaining) {
-              Write-Warning "Some placeholders may still remain!"
-          } else {
-              Write-Host "No placeholder strings detected."
-          }
+          if ($remaining) { Write-Warning "Some placeholders may still remain!" }
+          else { Write-Host "Verification OK: no raw placeholders remain." }
 
-      # ── ۶. Restore NuGet ──────────────────────────────────────────────────
+      # ── ۵. Restore ────────────────────────────────────────────────────────
       - name: Restore NuGet packages
         run: dotnet restore PsiphonUI\PsiphonUI.csproj
 
-      # ── ۷. Build ──────────────────────────────────────────────────────────
+      # ── ۶. Build ──────────────────────────────────────────────────────────
       - name: Build
         run: |
           dotnet build PsiphonUI\PsiphonUI.csproj `
@@ -240,19 +177,14 @@ jobs:
             --self-contained false `
             --no-restore
 
-      # ── ۸. آماده‌سازی پوشه خروجی + کپی Resources ──────────────────────────
+      # ── ۷. آماده‌سازی پوشه خروجی + کپی Resources ──────────────────────────
       - name: Prepare release folder
         shell: pwsh
         run: |
           $buildOut = "PsiphonUI\bin\Release\net8.0-windows10.0.19041.0\win-x64"
           $stage    = "stage\Se7enPro"
-
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-
-          # کپی exe + تمام dll ها
           Get-ChildItem -Path $buildOut -File | Copy-Item -Destination $stage
-
-          # کپی پوشه Resources کنار exe
           $res = "PsiphonUI\Resources"
           if (Test-Path $res) {
               Copy-Item -Path $res -Destination "$stage\Resources" -Recurse -Force
@@ -260,19 +192,18 @@ jobs:
           } else {
               Write-Warning "Resources folder not found!"
           }
-
-          Write-Host "`n=== Output structure ==="
+          Write-Host "=== Output files ==="
           Get-ChildItem -Path $stage -Recurse | Select-Object FullName
 
-      # ── ۹. Zip ────────────────────────────────────────────────────────────
-      - name: Zip release folder
+      # ── ۸. Zip ────────────────────────────────────────────────────────────
+      - name: Zip
         shell: pwsh
         run: |
           Compress-Archive -Path "stage\Se7enPro" -DestinationPath "Se7enPro-win-x64.zip" -Force
           $mb = [math]::Round((Get-Item "Se7enPro-win-x64.zip").Length / 1MB, 1)
           Write-Host "Zip: $mb MB"
 
-      # ── ۱۰. Upload Artifact (همیشه) ───────────────────────────────────────
+      # ── ۹. Upload Artifact ────────────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -280,7 +211,7 @@ jobs:
           path: stage\Se7enPro\
           if-no-files-found: error
 
-      # ── ۱۱. GitHub Release (فقط روی tag) ──────────────────────────────────
+      # ── ۱۰. GitHub Release (فقط روی tag) ──────────────────────────────────
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
