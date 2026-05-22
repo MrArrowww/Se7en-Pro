@@ -1,62 +1,94 @@
-name: Release
+name: Build & Release
 
 on:
+  # با هر push به master بیلد می‌شه
   push:
+    branches:
+      - master
     tags:
       - 'v*'
   workflow_dispatch:
 
 jobs:
-  build-and-release:
+  build:
     runs-on: windows-latest
 
     steps:
-      # ۱. گرفتن کد
+      # ── ۱. Checkout ──────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ۲. نصب .NET 8
+      # ── ۲. .NET 8 SDK ─────────────────────────────────────────
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
-      # ۳. Restore
+      # ── ۳. Restore ────────────────────────────────────────────
       - name: Restore NuGet packages
         run: dotnet restore PsiphonUI\PsiphonUI.csproj
 
-      # ۴. Publish — دقیقاً همون build.ps1 -Publish
-      - name: Publish (single-file, self-contained)
+      # ── ۴. Build (framework-dependent, dll های جداگانه) ───────
+      #   این همون خروجی release اصلی هست:
+      #   bin\Release\net8.0-windows10.0.19041.0\win-x64\
+      #     PsiphonUI.exe  + کنارش تمام dll ها
+      - name: Build
         run: |
-          dotnet publish PsiphonUI\PsiphonUI.csproj `
+          dotnet build PsiphonUI\PsiphonUI.csproj `
             -c Release `
             -r win-x64 `
-            --self-contained true `
-            -p:PublishSingleFile=true `
-            -p:IncludeNativeLibrariesForSelfExtract=true `
-            -p:EnableCompressionInSingleFile=true `
+            --self-contained false `
             --no-restore
 
-      # ۵. بررسی فایل خروجی
-      - name: Verify output
+      # ── ۵. آماده‌سازی پوشه خروجی نهایی ───────────────────────
+      #   ساختار: Se7enPro\
+      #              PsiphonUI.exe
+      #              *.dll
+      #              Resources\   ← کپی از سورس
+      - name: Prepare release folder
         shell: pwsh
         run: |
-          $exe = "PsiphonUI\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\PsiphonUI.exe"
-          if (-not (Test-Path $exe)) { Write-Error "Not found: $exe"; exit 1 }
-          $mb = [math]::Round((Get-Item $exe).Length / 1MB, 1)
-          Write-Host "OK: PsiphonUI.exe — $mb MB" -ForegroundColor Green
+          $buildOut  = "PsiphonUI\bin\Release\net8.0-windows10.0.19041.0\win-x64"
+          $stageDir  = "stage\Se7enPro"
 
-      # ۶. همیشه Artifact آپلود می‌شه (هم tag، هم workflow_dispatch)
+          # ساختن پوشه stage
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+          # کپی تمام فایل‌های بیلد (exe + dll ها) — بدون زیرپوشه
+          Get-ChildItem -Path $buildOut -File | Copy-Item -Destination $stageDir
+
+          # کپی پوشه Resources کنار exe (همانطور که برنامه انتظار داره)
+          $resourcesSrc = "PsiphonUI\Resources"
+          if (Test-Path $resourcesSrc) {
+              Copy-Item -Path $resourcesSrc -Destination "$stageDir\Resources" -Recurse -Force
+              Write-Host "Resources copied OK"
+          } else {
+              Write-Warning "Resources folder not found at $resourcesSrc"
+          }
+
+          # نمایش محتوای نهایی
+          Write-Host "`n=== Stage contents ==="
+          Get-ChildItem -Path $stageDir -Recurse | Select-Object FullName
+
+      # ── ۶. zip کردن برای آپلود ────────────────────────────────
+      - name: Zip release folder
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "stage\Se7enPro" -DestinationPath "Se7enPro-win-x64.zip" -Force
+          $mb = [math]::Round((Get-Item "Se7enPro-win-x64.zip").Length / 1MB, 1)
+          Write-Host "Zip size: $mb MB"
+
+      # ── ۷. Artifact (همیشه آپلود می‌شه — هم push، هم tag) ─────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PsiphonUI-win-x64
-          path: PsiphonUI\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\PsiphonUI.exe
+          name: Se7enPro-win-x64
+          path: stage\Se7enPro\
           if-no-files-found: error
 
-      # ۷. GitHub Release فقط روی tag ساخته می‌شه
+      # ── ۸. GitHub Release (فقط روی tag مثل v1.0.1) ──────────
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -65,6 +97,6 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
-          files: PsiphonUI\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\PsiphonUI.exe
+          files: Se7enPro-win-x64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
