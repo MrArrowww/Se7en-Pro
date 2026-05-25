@@ -25,135 +25,207 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      # ── ۳. دانلود psiphon3.exe و استخراج psiphon.config با روش مستقیم ───
+      # ── ۳. دانلود psiphon3.exe و استخراج کامل config + server_entries ────
       #
-      # psiphon3.exe یک single-exe هست که psiphon-tunnel-core.exe رو به عنوان
-      # resource داخل خودش embed کرده و هنگام اجرا extract می‌کنه.
-      # config رو قبل از اینکه GUI load بشه می‌نویسه.
-      # GitHub Actions روی Windows Server هست و می‌تونه GUI app اجرا کنه.
-      # مشکل قبلی این بود که %APPDATA% رو اشتباه چک می‌کردیم.
+      # psiphon3.exe هنگام اجرا:
+      #   1. psiphon.config رو می‌نویسه (شامل تمام embedded values)
+      #   2. server_entries.txt رو می‌نویسه (لیست سرورهای bootstrap)
+      # هر دو در %LOCALAPPDATA%\Psiphon3\ قرار می‌گیرن.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Download psiphon3.exe and extract config
+      - name: Extract config and server_entries from official Psiphon
         shell: pwsh
         run: |
-          # دانلود
-          Write-Host "Downloading psiphon3.exe ..."
+          Write-Host "=== Downloading psiphon3.exe ==="
           Invoke-WebRequest -Uri "https://psiphon.ca/psiphon3.exe" `
-                            -OutFile "psiphon3.exe" `
-                            -UseBasicParsing
-          Write-Host "Downloaded: $([math]::Round((Get-Item psiphon3.exe).Length/1MB,1)) MB"
+                            -OutFile "psiphon3.exe" -UseBasicParsing
+          Write-Host "Size: $([math]::Round((Get-Item psiphon3.exe).Length/1MB,1)) MB"
 
-          # اجرا با timeout — psiphon.config رو می‌نویسه قبل از GUI
+          Write-Host "`n=== Launching psiphon3.exe ==="
           $proc = Start-Process ".\psiphon3.exe" -PassThru -WindowStyle Hidden
 
-          # همه مسیرهای ممکن که psiphon config ممکنه نوشته بشه
-          $possiblePaths = @(
-              "$env:APPDATA\Psiphon3\psiphon.config",
-              "$env:LOCALAPPDATA\Psiphon3\psiphon.config",
-              "$env:APPDATA\Psiphon\psiphon.config",
-              "$env:LOCALAPPDATA\Psiphon\psiphon.config"
+          # صبر برای نوشته شدن config — max 60 ثانیه
+          # psiphon3.exe فایل‌ها رو قبل از load شدن UI می‌نویسه
+          $configPath        = $null
+          $serverEntriesPath = $null
+
+          $searchPaths = @(
+              "$env:LOCALAPPDATA\Psiphon3",
+              "$env:APPDATA\Psiphon3",
+              "$env:LOCALAPPDATA\Psiphon",
+              "$env:APPDATA\Psiphon",
+              "$env:TEMP"
           )
 
-          $configPath = $null
-          for ($i = 0; $i -lt 45; $i++) {
+          for ($i = 1; $i -le 60; $i++) {
               Start-Sleep -Seconds 1
-              foreach ($p in $possiblePaths) {
-                  if (Test-Path $p) { $configPath = $p; break }
+
+              foreach ($base in $searchPaths) {
+                  $c = Join-Path $base "psiphon.config"
+                  $s = Join-Path $base "server_entries.dat"
+                  $s2 = Join-Path $base "server_entries.txt"
+                  if ((Test-Path $c) -and -not $configPath) { $configPath = $c }
+                  if ((Test-Path $s) -and -not $serverEntriesPath) { $serverEntriesPath = $s }
+                  if ((Test-Path $s2) -and -not $serverEntriesPath) { $serverEntriesPath = $s2 }
               }
-              if ($configPath) { break }
-              if ($i % 5 -eq 0) { Write-Host "  Waiting... ($i s)" }
+
+              if ($configPath) {
+                  # صبر کمی بیشتر تا server_entries هم نوشته بشه
+                  if ($i -ge 5) { break }
+              }
+
+              if ($i % 10 -eq 0) { Write-Host "  Waiting... ($i s)" }
           }
 
-          # متوقف کردن psiphon و tunnel-core
-          try { $proc | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
-          Get-Process -Name "psiphon*","psiphon-tunnel-core" -ErrorAction SilentlyContinue |
-              Stop-Process -Force -ErrorAction SilentlyContinue
+          # kill همه پروسه‌های psiphon
+          "psiphon3","psiphon-tunnel-core" | ForEach-Object {
+              Get-Process -Name $_ -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
 
+          # ── Debug: نمایش همه چیزی که نوشته شده ──
+          Write-Host "`n=== Files written by psiphon3.exe ==="
+          $searchPaths | ForEach-Object {
+              if (Test-Path $_) {
+                  Get-ChildItem $_ -Recurse -ErrorAction SilentlyContinue |
+                      Select-Object FullName, Length | Format-Table -AutoSize
+              }
+          }
+
+          # ── اگه config پیدا نشد: fail با راهنمایی ──
           if (-not $configPath) {
-              # debug: نشون بده چی تو AppData هست
-              Write-Host "`nAppData contents:"
-              Get-ChildItem "$env:APPDATA" -ErrorAction SilentlyContinue | Select-Object Name
-              Get-ChildItem "$env:LOCALAPPDATA" -ErrorAction SilentlyContinue | Select-Object Name
-              Write-Host "`nTemp contents (psiphon files):"
-              Get-ChildItem $env:TEMP -Filter "*psiphon*" -Recurse -ErrorAction SilentlyContinue |
+              Write-Host "`nERROR: psiphon.config not found. Searching entire user profile..."
+              Get-ChildItem $env:USERPROFILE -Recurse -Filter "psiphon.config" -ErrorAction SilentlyContinue |
                   Select-Object FullName
-
-              Write-Error "psiphon.config not found in any expected location after 45 seconds"
+              Get-ChildItem $env:USERPROFILE -Recurse -Filter "*.config" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -like "*psiphon*" } | Select-Object FullName
+              Write-Error "psiphon.config not found after 60 seconds"
               exit 1
           }
 
-          Write-Host "Config found: $configPath"
+          Write-Host "`nConfig path: $configPath"
           $json = Get-Content $configPath -Raw | ConvertFrom-Json
 
-          # ── استخراج و ذخیره در GITHUB_ENV ──
-          function Set-GHEnv($name, $value) {
-              if ($value) {
-                  $d = "EOF_" + ([guid]::NewGuid().ToString("N").Substring(0,8))
-                  Add-Content $env:GITHUB_ENV "$name<<$d"
-                  Add-Content $env:GITHUB_ENV "$value"
-                  Add-Content $env:GITHUB_ENV "$d"
+          # ── helper: ذخیره در GITHUB_ENV (multiline safe) ──
+          function Set-GHEnv([string]$name, $value) {
+              if ($null -eq $value -or $value -eq "") { return }
+              if ($value -is [Array] -or $value -is [System.Management.Automation.PSCustomObject]) {
+                  $value = $value | ConvertTo-Json -Compress -Depth 10
               }
+              $d = "GHEOF_" + [guid]::NewGuid().ToString("N").Substring(0,8)
+              Add-Content $env:GITHUB_ENV "$name<<$d"
+              Add-Content $env:GITHUB_ENV "$value"
+              Add-Content $env:GITHUB_ENV $d
           }
 
-          Set-GHEnv "PSI_PROPAGATION_CHANNEL_ID" $json.PropagationChannelId
-          Set-GHEnv "PSI_SPONSOR_ID"             $json.SponsorId
-          Set-GHEnv "PSI_RSL_SIG_KEY"   $json.RemoteServerListSignaturePublicKey
-          Set-GHEnv "PSI_SE_SIG_KEY"    $json.ServerEntrySignaturePublicKey
-          Set-GHEnv "PSI_FB_ENC_KEY"    $json.FeedbackEncryptionPublicKey
-          Set-GHEnv "PSI_UPG_SIG_KEY"   $json.UpgradeSignaturePublicKey
+          # ── استخراج تمام فیلدهای EmbeddedValues از config ──
+          # (نام فیلدها ۱:۱ با EmbeddedValues.cs و embeddedvalues.h هستن)
+          Set-GHEnv "PSI_PROPAGATION_CHANNEL_ID"              $json.PropagationChannelId
+          Set-GHEnv "PSI_SPONSOR_ID"                          $json.SponsorId
+          Set-GHEnv "PSI_CLIENT_VERSION"                      $json.ClientVersion
+          Set-GHEnv "PSI_RSL_URL"                             $json.RemoteServerListUrl
+          Set-GHEnv "PSI_RSL_URLS_JSON"                       $json.RemoteServerListURLs
+          Set-GHEnv "PSI_RSL_SIG_KEY"                         $json.RemoteServerListSignaturePublicKey
+          Set-GHEnv "PSI_OSL_ROOT_URLS_JSON"                  $json.ObfuscatedServerListRootURLs
+          Set-GHEnv "PSI_SE_SIG_KEY"                          $json.ServerEntrySignaturePublicKey
+          Set-GHEnv "PSI_FEEDBACK_ENC_KEY"                    $json.FeedbackEncryptionPublicKey
+          Set-GHEnv "PSI_FEEDBACK_UPLOAD_SERVER"              $json.FeedbackUploadServer
+          Set-GHEnv "PSI_FEEDBACK_UPLOAD_PATH"                $json.FeedbackUploadPath
+          Set-GHEnv "PSI_FEEDBACK_UPLOAD_SERVER_HEADERS"      $json.FeedbackUploadServerHeaders
+          Set-GHEnv "PSI_UPGRADE_DOWNLOAD_URL"                $json.UpgradeDownloadUrl
+          Set-GHEnv "PSI_UPGRADE_DOWNLOAD_URLS_JSON"          $json.UpgradeDownloadURLs
+          Set-GHEnv "PSI_UPGRADE_SIG_KEY"                     $json.UpgradePublicKey
+          Set-GHEnv "PSI_INFO_LINK_URL"                       $json.InfoLinkUrl
+          Set-GHEnv "PSI_HOMEPAGE_NOTICES_URL"                $json.HomepageNoticesUrl
+          Set-GHEnv "PSI_CLIENT_CAPABILITIES"                 $json.ClientCapabilities
 
-          Write-Host "`n=== Extracted ==="
+          Write-Host "`n=== Extracted Values ==="
           Write-Host "  PropagationChannelId = $($json.PropagationChannelId)"
           Write-Host "  SponsorId            = $($json.SponsorId)"
-          Write-Host "  RSL sig key len      = $($json.RemoteServerListSignaturePublicKey.Length)"
-          
-      - name: Fetch Psiphon server list
-        shell: pwsh
-        run: |
-          $serverList = "$env:APPDATA\Psiphon3\server_list.dat"
-          
-          # صبر کن تا server_list.dat هم نوشته بشه (psiphon3 باید در حال اجرا بوده باشه)
-          if (Test-Path $serverList) {
-              Copy-Item $serverList "PsiphonUI\Resources\server_entries.txt"
-              $lines = (Get-Content $serverList).Count
-              Write-Host "server_list.dat copied: $lines entries"
+          Write-Host "  ClientVersion        = $($json.ClientVersion)"
+          Write-Host "  RSL SigKey len       = $($json.RemoteServerListSignaturePublicKey.Length)"
+          Write-Host "  SE SigKey len        = $($json.ServerEntrySignaturePublicKey.Length)"
+
+          # ── کپی server_entries اگه وجود داشت ──
+          if ($serverEntriesPath) {
+              Write-Host "`nserver_entries found: $serverEntriesPath"
+              Copy-Item $serverEntriesPath "server_entries_psiphon3.dat" -Force
+              Add-Content $env:GITHUB_ENV "PSI_HAS_SERVER_ENTRIES=true"
           } else {
-              Write-Warning "server_list.dat not found - tunnel-core will use remote server list URLs only"
+              Write-Host "`nserver_entries not found (will rely on remote server list)"
+              Add-Content $env:GITHUB_ENV "PSI_HAS_SERVER_ENTRIES=false"
           }
-          
-      # ── ۴. تزریق به EmbeddedValues.cs ────────────────────────────────────
-      - name: Inject EmbeddedValues
+
+          # ── validation ──
+          if (-not $json.PropagationChannelId -or -not $json.SponsorId) {
+              Write-Host "`nAll JSON keys present in config:"
+              $json.PSObject.Properties.Name | ForEach-Object { Write-Host "  $_" }
+              Write-Error "PropagationChannelId or SponsorId is empty!"
+              exit 1
+          }
+
+          Write-Host "`nExtraction complete!"
+
+      # ── ۴. تزریق کامل به EmbeddedValues.cs ──────────────────────────────
+      - name: Inject EmbeddedValues.cs
         shell: pwsh
         run: |
           $file = "PsiphonUI\Services\EmbeddedValues.cs"
-          if (-not (Test-Path $file)) { Write-Error "EmbeddedValues.cs not found"; exit 1 }
+          if (-not (Test-Path $file)) { Write-Error "EmbeddedValues.cs not found!"; exit 1 }
 
           $c = Get-Content $file -Raw
 
-          function Patch($text, $old, $new, $label) {
-              if (-not $new) { Write-Warning "SKIP (empty): $label"; return $text }
-              $r = $text -replace ([regex]::Escape($old)), ($new -replace '\\','\\\\')
-              if ($r -eq $text) { Write-Warning "NOT FOUND: $label placeholder '$old'" }
-              else { Write-Host "  OK: $label" }
-              return $r
+          # پیدا کردن همه placeholder ها در فایل
+          Write-Host "=== Placeholders found in EmbeddedValues.cs ==="
+          [regex]::Matches($c, '"[A-Z_]{5,}"') | ForEach-Object { Write-Host "  $($_.Value)" }
+
+          # تابع patch
+          function Patch([ref]$text, [string]$placeholder, [string]$value, [string]$label) {
+              if (-not $value) { Write-Warning "SKIP (empty): $label"; return }
+              $escaped = [regex]::Escape($placeholder)
+              $new = $text.Value -replace $escaped, $value
+              if ($new -eq $text.Value) { Write-Warning "NOT FOUND: '$placeholder' for $label" }
+              else {
+                  $text.Value = $new
+                  Write-Host "  OK: $label"
+              }
           }
 
-          Write-Host "Patching EmbeddedValues.cs..."
-          $c = Patch $c "PROPAGATION_CHANNEL_ID" $env:PSI_PROPAGATION_CHANNEL_ID "PropagationChannelId"
-          $c = Patch $c "SPONSOR_ID"             $env:PSI_SPONSOR_ID             "SponsorId"
-          $c = Patch $c "REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY" $env:PSI_RSL_SIG_KEY  "RemoteServerListSigKey"
-          $c = Patch $c "SERVER_ENTRY_SIGNATURE_PUBLIC_KEY"       $env:PSI_SE_SIG_KEY   "ServerEntrySigKey"
-          $c = Patch $c "FEEDBACK_ENCRYPTION_PUBLIC_KEY"          $env:PSI_FB_ENC_KEY   "FeedbackEncKey"
-          $c = Patch $c "UPGRADE_SIGNATURE_PUBLIC_KEY"            $env:PSI_UPG_SIG_KEY  "UpgradeSigKey"
+          Write-Host "`n=== Injecting ==="
+          Patch ([ref]$c) "PROPAGATION_CHANNEL_ID"             $env:PSI_PROPAGATION_CHANNEL_ID        "PropagationChannelId"
+          Patch ([ref]$c) "SPONSOR_ID"                         $env:PSI_SPONSOR_ID                    "SponsorId"
+          Patch ([ref]$c) "CLIENT_VERSION"                     $env:PSI_CLIENT_VERSION                "ClientVersion"
+          Patch ([ref]$c) "REMOTE_SERVER_LIST_URL"             $env:PSI_RSL_URL                       "RemoteServerListUrl"
+          Patch ([ref]$c) "REMOTE_SERVER_LIST_SIGNATURE_PUBLIC_KEY" $env:PSI_RSL_SIG_KEY              "RemoteServerListSignaturePublicKey"
+          Patch ([ref]$c) "SERVER_ENTRY_SIGNATURE_PUBLIC_KEY"  $env:PSI_SE_SIG_KEY                    "ServerEntrySignaturePublicKey"
+          Patch ([ref]$c) "FEEDBACK_ENCRYPTION_PUBLIC_KEY"     $env:PSI_FEEDBACK_ENC_KEY              "FeedbackEncryptionPublicKey"
+          Patch ([ref]$c) "UPGRADE_SIGNATURE_PUBLIC_KEY"       $env:PSI_UPGRADE_SIG_KEY               "UpgradeSignaturePublicKey"
 
           Set-Content $file $c -NoNewline
-          Write-Host "Done."
 
-      # ── ۵. Restore ────────────────────────────────────────────────────────
+          Write-Host "`n=== Remaining placeholders (should be none for critical fields) ==="
+          $remaining = [regex]::Matches($c, '"PROPAGATION_CHANNEL_ID"|"SPONSOR_ID"')
+          if ($remaining.Count -gt 0) {
+              Write-Error "Critical placeholders still remain!"
+              exit 1
+          }
+          Write-Host "  None — injection successful."
+
+      # ── ۵. کپی server_entries.txt اگه وجود داشت ─────────────────────────
+      - name: Copy server_entries (if available)
+        if: env.PSI_HAS_SERVER_ENTRIES == 'true'
+        shell: pwsh
+        run: |
+          # server_entries رو به Resources کپی کن
+          # tunnel-core از این برای bootstrap استفاده می‌کنه
+          # و از psiphon3.exe اصلی گرفته شده
+          Copy-Item "server_entries_psiphon3.dat" `
+                    "PsiphonUI\Resources\server_entries.txt" -Force
+          Write-Host "server_entries.txt copied to Resources."
+
+      # ── ۶. Restore ────────────────────────────────────────────────────────
       - name: Restore NuGet packages
         run: dotnet restore PsiphonUI\PsiphonUI.csproj
 
-      # ── ۶. Build ──────────────────────────────────────────────────────────
+      # ── ۷. Build ──────────────────────────────────────────────────────────
       - name: Build
         run: |
           dotnet build PsiphonUI\PsiphonUI.csproj `
@@ -162,27 +234,37 @@ jobs:
             --self-contained false `
             --no-restore
 
-      # ── ۷. Stage: exe + dll ها + Resources ───────────────────────────────
+      # ── ۸. Stage: exe + dll ها + Resources ───────────────────────────────
       - name: Prepare release folder
         shell: pwsh
         run: |
           $out   = "PsiphonUI\bin\Release\net8.0-windows10.0.19041.0\win-x64"
           $stage = "stage\Se7enPro"
           New-Item -ItemType Directory -Force $stage | Out-Null
+
+          # exe + تمام dll ها
           Get-ChildItem $out -File | Copy-Item -Destination $stage
+
+          # پوشه Resources (شامل psiphon-tunnel-core.exe، xray، wintun، ...)
           if (Test-Path "PsiphonUI\Resources") {
               Copy-Item "PsiphonUI\Resources" "$stage\Resources" -Recurse -Force
-              Write-Host "Resources copied"
+              Write-Host "Resources copied."
+          } else {
+              Write-Error "Resources folder not found!"
+              exit 1
           }
 
-      # ── ۸. Zip ────────────────────────────────────────────────────────────
+          Write-Host "`n=== Final structure ==="
+          Get-ChildItem $stage -Recurse | Select-Object FullName
+
+      # ── ۹. Zip ────────────────────────────────────────────────────────────
       - name: Zip
         shell: pwsh
         run: |
           Compress-Archive "stage\Se7enPro" "Se7enPro-win-x64.zip" -Force
           Write-Host "Zip: $([math]::Round((Get-Item Se7enPro-win-x64.zip).Length/1MB,1)) MB"
 
-      # ── ۹. Artifact ───────────────────────────────────────────────────────
+      # ── ۱۰. Artifact ──────────────────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -190,7 +272,7 @@ jobs:
           path: stage\Se7enPro\
           if-no-files-found: error
 
-      # ── ۱۰. Release روی tag ───────────────────────────────────────────────
+      # ── ۱۱. GitHub Release روی tag ────────────────────────────────────────
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
